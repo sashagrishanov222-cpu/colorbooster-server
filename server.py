@@ -3,7 +3,6 @@ import html
 import json
 import secrets
 import hashlib
-import base64
 
 from datetime import datetime, timezone, timedelta, date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,115 +11,195 @@ from urllib.parse import urlparse, parse_qs
 import psycopg
 
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "8765"))
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "change-me")
+ADMIN_USER = os.environ.get(
+    "ADMIN_USER",
+    "admin"
+)
 
-# ============================================
-# НАСТРОЙКИ ЛИЦЕНЗИЙ
-# ============================================
+ADMIN_PASSWORD = os.environ.get(
+    "ADMIN_PASSWORD",
+    "change-me"
+)
 
-# Срок автоматически выдаваемой лицензии.
-# 365 = 1 год.
-LICENSE_DAYS = 365
 
-# ДОЛЖЕН СОВПАДАТЬ С main.cpp
-LICENSE_SECRET = "CB_INTERNAL_2026_SECRET_7F3A91"
+# ============================================================
+# COLORBOOSTER LICENSE SETTINGS
+# ============================================================
+
+LICENSE_SECRET = (
+    "CB_INTERNAL_2026_SECRET_7F3A91"
+)
+
+PURCHASE_PREFIX = "CB-PURCHASE"
 
 SESSIONS = set()
 
 
-# ============================================
+# ============================================================
 # DATABASE
-# ============================================
+# ============================================================
 
 def db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not configured")
 
-    return psycopg.connect(DATABASE_URL)
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not configured"
+        )
+
+    return psycopg.connect(
+        DATABASE_URL
+    )
 
 
 def init_db():
+
     with db() as c:
 
+        # USERS
         c.execute("""
             CREATE TABLE IF NOT EXISTS users(
+
                 id BIGSERIAL PRIMARY KEY,
+
                 email TEXT UNIQUE NOT NULL,
+
                 password_hash TEXT NOT NULL,
+
                 hwid TEXT,
-                status TEXT NOT NULL DEFAULT 'active',
+
+                status TEXT NOT NULL
+                    DEFAULT 'active',
+
                 expires_at TIMESTAMPTZ,
+
                 activation_key TEXT,
-                first_seen TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                last_seen TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+
+                first_seen TIMESTAMPTZ
+                    NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                last_seen TIMESTAMPTZ
+                    NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
+
             )
         """)
 
+
+        # Compatibility with old database
         c.execute("""
             ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'
+            ADD COLUMN IF NOT EXISTS status
+            TEXT NOT NULL DEFAULT 'active'
         """)
 
         c.execute("""
             ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ
+            ADD COLUMN IF NOT EXISTS expires_at
+            TIMESTAMPTZ
         """)
 
         c.execute("""
             ALTER TABLE users
-            ADD COLUMN IF NOT EXISTS activation_key TEXT
+            ADD COLUMN IF NOT EXISTS activation_key
+            TEXT
         """)
 
+
+        # OLD ACTIVATION KEYS
         c.execute("""
             CREATE TABLE IF NOT EXISTS activation_keys(
+
                 id BIGSERIAL PRIMARY KEY,
+
                 key TEXT UNIQUE NOT NULL,
+
                 expires_at TIMESTAMPTZ,
-                max_uses INTEGER NOT NULL DEFAULT 1,
-                uses INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+
+                max_uses INTEGER NOT NULL
+                    DEFAULT 1,
+
+                uses INTEGER NOT NULL
+                    DEFAULT 0,
+
+                created_at TIMESTAMPTZ NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP
+
             )
         """)
 
 
-# ============================================
-# PASSWORD
-# ============================================
+        # PURCHASE CODES
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS purchase_codes(
+
+                id BIGSERIAL PRIMARY KEY,
+
+                code TEXT UNIQUE NOT NULL,
+
+                duration_days INTEGER NOT NULL,
+
+                used BOOLEAN NOT NULL
+                    DEFAULT FALSE,
+
+                used_by TEXT,
+
+                created_at TIMESTAMPTZ NOT NULL
+                    DEFAULT CURRENT_TIMESTAMP,
+
+                used_at TIMESTAMPTZ
+
+            )
+        """)
+
+
+# ============================================================
+# PASSWORD HASH
+# ============================================================
 
 def ph(password):
+
     data = hashlib.pbkdf2_hmac(
         "sha256",
-        password.encode(),
+        password.encode("utf-8"),
         b"ColorBooster-2026",
         120000
     )
 
-    return base64.b64encode(data).decode()
+    return data.hex()
 
 
-# ============================================
-# DATE
-# ============================================
+# ============================================================
+# DATE HELPERS
+# ============================================================
 
-def dt(value):
+def parse_datetime(value):
+
     value = (value or "").strip()
 
     if not value:
         return None
 
     try:
+
         return datetime.strptime(
             value,
             "%Y-%m-%dT%H:%M"
-        ).replace(tzinfo=timezone.utc)
+        ).replace(
+            tzinfo=timezone.utc
+        )
 
     except ValueError:
+
         return None
 
 
@@ -130,53 +209,122 @@ def fmt(value):
         return "—"
 
     if hasattr(value, "strftime"):
-        return value.strftime("%Y-%m-%d %H:%M UTC")
+
+        return value.strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
 
     return str(value)
 
 
-# ============================================
-# LICENSE GENERATOR
-# ============================================
+def days_since_2020():
 
-def current_days_since_2020():
-
-    today = date.today()
-    base = date(2020, 1, 1)
-
-    return (today - base).days
+    return (
+        date.today()
+        - date(2020, 1, 1)
+    ).days
 
 
-def make_license(days=LICENSE_DAYS):
+# ============================================================
+# COLORBOOSTER LICENSE GENERATOR
+# ============================================================
 
-    expiry_days = current_days_since_2020() + days
+def make_license(duration_days):
 
-    # Именно 8 HEX символов, как ожидает main.cpp
-    expiry_hex = f"{expiry_days:08X}"
+    # 0 = forever
+    if duration_days == 0:
 
-    # 16 случайных HEX символов
-    random_part = secrets.token_hex(8).upper()
+        expiry = 0xFFFFFFFF
 
-    payload = expiry_hex + random_part
+    else:
 
-    # ДОЛЖНО совпадать с main.cpp:
-    # SHA256(LICENSE_SECRET + expiryHex + random)
+        expiry = (
+            days_since_2020()
+            + duration_days
+        )
+
+
+    expiry_hex = (
+        f"{expiry & 0xFFFFFFFF:08X}"
+    )
+
+
+    # 16 HEX characters
+    random_part = (
+        secrets.token_hex(8)
+        .upper()
+    )
+
+
+    payload = (
+        expiry_hex
+        + random_part
+    )
+
+
     digest = hashlib.sha256(
-        (LICENSE_SECRET + payload).encode("utf-8")
+        (
+            LICENSE_SECRET
+            + payload
+        ).encode("utf-8")
     ).hexdigest().upper()
+
 
     check = digest[:8]
 
-    return f"CB-{expiry_hex}-{random_part}-{check}"
+
+    # EXACT FORMAT USED BY COLORBOOSTER:
+    #
+    # CB-XXXXXXXX-XXXXXXXXXXXXXXXX-XXXXXXXX
+
+    return (
+        "CB-"
+        + expiry_hex
+        + "-"
+        + random_part
+        + "-"
+        + check
+    )
 
 
-# ============================================
+# ============================================================
+# PURCHASE CODE GENERATOR
+# ============================================================
+
+def make_purchase_code():
+
+    alphabet = (
+        "ABCDEFGHJKLMNPQRSTUVWXYZ"
+        "23456789"
+    )
+
+
+    part1 = "".join(
+        secrets.choice(alphabet)
+        for _ in range(4)
+    )
+
+
+    part2 = "".join(
+        secrets.choice(alphabet)
+        for _ in range(4)
+    )
+
+
+    return (
+        f"{PURCHASE_PREFIX}-"
+        f"{part1}-{part2}"
+    )
+
+
+# ============================================================
 # HTML
-# ============================================
+# ============================================================
 
 def page(title, body):
 
     return f"""<!doctype html>
+
 <html lang="ru">
 
 <head>
@@ -184,7 +332,7 @@ def page(title, body):
 <meta charset="utf-8">
 
 <meta name="viewport"
-content="width=device-width,initial-scale=1">
+      content="width=device-width,initial-scale=1">
 
 <title>{html.escape(title)}</title>
 
@@ -195,52 +343,90 @@ content="width=device-width,initial-scale=1">
 }}
 
 body {{
-    font-family: Arial, sans-serif;
-    background: #101216;
-    color: #eee;
+
     margin: 0;
+
+    background:
+        #0d0f13;
+
+    color: #eeeeee;
+
+    font-family:
+        Arial,
+        sans-serif;
+
 }}
 
 .box {{
-    max-width: 1250px;
+
+    max-width: 1300px;
+
     margin: 40px auto;
-    background: #1b1e24;
+
     padding: 28px;
-    border-radius: 14px;
+
+    background: #181b21;
+
+    border-radius: 16px;
+
 }}
 
 .card {{
-    background: #15181d;
-    border: 1px solid #30343c;
+
+    background: #111318;
+
+    border: 1px solid #2d3139;
+
     border-radius: 12px;
+
     padding: 20px;
+
     margin: 18px 0;
+
 }}
 
-input {{
-    box-sizing: border-box;
-    padding: 10px;
+input,
+select {{
+
+    padding: 11px;
+
     border-radius: 7px;
+
     border: 1px solid #444;
-    background: #111;
-    color: #fff;
+
+    background: #0d0f13;
+
+    color: white;
+
 }}
 
 .full {{
+
     width: 100%;
+
     margin: 7px 0 15px;
+
 }}
 
 button,
 .btn {{
+
     display: inline-block;
-    padding: 10px 15px;
-    border: 0;
+
+    padding: 10px 16px;
+
+    border: none;
+
     border-radius: 7px;
+
     background: #4d7cff;
-    color: #fff;
-    text-decoration: none;
+
+    color: white;
+
     cursor: pointer;
+
+    text-decoration: none;
+
 }}
 
 .green {{
@@ -248,66 +434,111 @@ button,
 }}
 
 .danger {{
-    background: #b63b3b;
+    background: #a63838;
 }}
 
 .gray {{
     background: #555;
 }}
 
-.license {{
-    display: block;
-    background: #0d0f13;
-    border: 1px solid #4d7cff;
-    padding: 18px;
-    border-radius: 10px;
-    font-size: 20px;
+.purchase {{
+
     font-family: Consolas, monospace;
+
+    font-size: 20px;
+
+    background: #090b0f;
+
+    border: 1px solid #4d7cff;
+
+    padding: 16px;
+
+    border-radius: 9px;
+
     word-break: break-all;
-    color: #fff;
-    margin: 15px 0;
+
+}}
+
+.license {{
+
+    font-family: Consolas, monospace;
+
+    font-size: 20px;
+
+    background: #090b0f;
+
+    border: 1px solid #50d890;
+
+    padding: 16px;
+
+    border-radius: 9px;
+
+    word-break: break-all;
+
 }}
 
 .muted {{
-    color: #aaa;
+    color: #999;
 }}
 
 table {{
+
     width: 100%;
+
     border-collapse: collapse;
-    margin-top: 18px;
+
+    margin-top: 15px;
+
 }}
 
-td,
-th {{
-    padding: 8px;
-    border-bottom: 1px solid #383c44;
+th,
+td {{
+
+    padding: 9px;
+
+    border-bottom:
+        1px solid #30343b;
+
     text-align: left;
+
     vertical-align: top;
+
 }}
 
 code {{
+
     word-break: break-all;
+
 }}
 
 .badge {{
+
+    display: inline-block;
+
     padding: 4px 8px;
+
     border-radius: 12px;
-    background: #285d39;
+
+    background: #28633d;
+
 }}
 
-.blocked {{
-    background: #7b2e2e;
+.badge.red {{
+    background: #7b3030;
 }}
 
-.expired {{
-    background: #765b25;
+.badge.yellow {{
+    background: #765d27;
 }}
 
 .actions {{
+
     display: flex;
+
     gap: 6px;
+
     flex-wrap: wrap;
+
 }}
 
 </style>
@@ -327,127 +558,220 @@ code {{
 </html>"""
 
 
-# ============================================
-# ADMIN SESSION
-# ============================================
+# ============================================================
+# ADMIN AUTH
+# ============================================================
 
-def admin(request):
+def is_admin(handler):
 
-    return any(
-        x.strip().startswith("cb_admin=")
-        and x.strip().split("=", 1)[1] in SESSIONS
-
-        for x in request.headers.get(
-            "Cookie",
-            ""
-        ).split(";")
+    cookie = handler.headers.get(
+        "Cookie",
+        ""
     )
 
+    for item in cookie.split(";"):
 
-def redirect_admin(handler):
+        item = item.strip()
 
-    handler.send_response(303)
-    handler.send_header("Location", "/admin")
-    handler.end_headers()
+        if item.startswith("cb_admin="):
+
+            token = item.split(
+                "=",
+                1
+            )[1]
+
+            if token in SESSIONS:
+                return True
+
+    return False
 
 
-# ============================================
-# HTTP SERVER
-# ============================================
+# ============================================================
+# HTTP HANDLER
+# ============================================================
 
-class H(BaseHTTPRequestHandler):
+class Handler(BaseHTTPRequestHandler):
 
-    def log_message(self, fmt_string, *args):
-        print(fmt_string % args)
 
-    def html(self, text, status=200, headers=()):
+    def log_message(
+        self,
+        fmt_string,
+        *args
+    ):
 
-        data = text.encode()
+        print(
+            fmt_string % args
+        )
 
-        self.send_response(status)
+
+    # ========================================================
+    # RESPONSE HTML
+    # ========================================================
+
+    def send_html(
+        self,
+        text,
+        status=200,
+        headers=()
+    ):
+
+        data = text.encode(
+            "utf-8"
+        )
+
+
+        self.send_response(
+            status
+        )
+
 
         self.send_header(
             "Content-Type",
             "text/html; charset=utf-8"
         )
 
+
         self.send_header(
             "Content-Length",
             str(len(data))
         )
 
+
         for key, value in headers:
-            self.send_header(key, value)
+
+            self.send_header(
+                key,
+                value
+            )
+
 
         self.end_headers()
 
-        self.wfile.write(data)
+
+        self.wfile.write(
+            data
+        )
 
 
-    def js(self, data, status=200):
+    # ========================================================
+    # JSON
+    # ========================================================
+
+    def send_json(
+        self,
+        data,
+        status=200
+    ):
 
         body = json.dumps(
             data,
             ensure_ascii=False
-        ).encode()
+        ).encode(
+            "utf-8"
+        )
 
-        self.send_response(status)
+
+        self.send_response(
+            status
+        )
+
 
         self.send_header(
             "Content-Type",
             "application/json; charset=utf-8"
         )
 
+
         self.send_header(
             "Content-Length",
             str(len(body))
         )
 
+
         self.end_headers()
 
-        self.wfile.write(body)
+
+        self.wfile.write(
+            body
+        )
 
 
-    def body(self):
+    # ========================================================
+    # READ BODY
+    # ========================================================
 
-        return self.rfile.read(
-            int(
-                self.headers.get(
-                    "Content-Length",
-                    "0"
-                )
+    def read_body(self):
+
+        length = int(
+            self.headers.get(
+                "Content-Length",
+                "0"
             )
         )
 
 
-    # ========================================
-    # GET
-    # ========================================
-
-    def do_GET(self):
-
-        p = urlparse(self.path).path
-        q = parse_qs(
-            urlparse(self.path).query
+        return self.rfile.read(
+            length
         )
 
 
-        # HOME
-        if p == "/":
+    # ========================================================
+    # REDIRECT
+    # ========================================================
 
-            return self.html(
+    def redirect(self, location):
+
+        self.send_response(
+            303
+        )
+
+        self.send_header(
+            "Location",
+            location
+        )
+
+        self.end_headers()
+
+
+    # ========================================================
+    # GET
+    # ========================================================
+
+    def do_GET(self):
+
+        parsed = urlparse(
+            self.path
+        )
+
+        path = parsed.path
+
+        query = parse_qs(
+            parsed.query
+        )
+
+
+        # ----------------------------------------------------
+        # HOME
+        # ----------------------------------------------------
+
+        if path == "/":
+
+            return self.send_html(
                 page(
                     "ColorBooster",
                     """
-                    <h1>ColorBooster</h1>
+                    <h1>
+                    ColorBooster
+                    </h1>
 
                     <p>
-                    Сервер регистрации и лицензий.
+                    Система регистрации
+                    и лицензий.
                     </p>
 
                     <a class="btn"
                        href="/register">
-                       Регистрация
+                       Получить ключ
                     </a>
 
                     <a class="btn gray"
@@ -459,30 +783,39 @@ class H(BaseHTTPRequestHandler):
             )
 
 
+        # ----------------------------------------------------
         # REGISTER
-        if p == "/register":
+        # ----------------------------------------------------
 
-            return self.html(
+        if path == "/register":
+
+            return self.send_html(
                 page(
                     "Регистрация",
                     """
-                    <h1>Регистрация ColorBooster</h1>
+                    <h1>
+                    Регистрация ColorBooster
+                    </h1>
 
                     <div class="card">
 
                     <form method="post"
                           action="/register">
 
-                    <label>Почта</label>
+                    <label>
+                    Email
+                    </label>
 
                     <input
                         class="full"
                         name="email"
                         type="email"
                         required
-                        placeholder="example@gmail.com">
+                        placeholder="you@example.com">
 
-                    <label>Пароль</label>
+                    <label>
+                    Пароль
+                    </label>
 
                     <input
                         class="full"
@@ -492,15 +825,27 @@ class H(BaseHTTPRequestHandler):
                         required
                         placeholder="Минимум 6 символов">
 
+                    <label>
+                    Код покупки
+                    </label>
+
+                    <input
+                        class="full"
+                        name="purchase_code"
+                        required
+                        placeholder="CB-PURCHASE-XXXX-XXXX">
+
                     <button class="green">
-                        Зарегистрироваться
+                    Зарегистрироваться
                     </button>
 
                     </form>
 
                     <p class="muted">
-                    После регистрации лицензионный ключ
-                    будет создан автоматически.
+
+                    Код покупки выдаётся
+                    после приобретения ColorBooster.
+
                     </p>
 
                     </div>
@@ -509,26 +854,35 @@ class H(BaseHTTPRequestHandler):
             )
 
 
+        # ----------------------------------------------------
         # ADMIN LOGIN
-        if p == "/admin/login":
+        # ----------------------------------------------------
 
-            return self.html(
+        if path == "/admin/login":
+
+            return self.send_html(
                 page(
                     "Админ-панель",
                     """
-                    <h1>Админ-панель</h1>
+                    <h1>
+                    Админ-панель
+                    </h1>
 
                     <form method="post"
                           action="/admin/login">
 
-                    <label>Логин</label>
+                    <label>
+                    Логин
+                    </label>
 
                     <input
                         class="full"
                         name="user"
                         required>
 
-                    <label>Пароль</label>
+                    <label>
+                    Пароль
+                    </label>
 
                     <input
                         class="full"
@@ -537,7 +891,7 @@ class H(BaseHTTPRequestHandler):
                         required>
 
                     <button>
-                        Войти
+                    Войти
                     </button>
 
                     </form>
@@ -546,49 +900,73 @@ class H(BaseHTTPRequestHandler):
             )
 
 
+        # ----------------------------------------------------
         # ADMIN LOGOUT
-        if p == "/admin/logout":
+        # ----------------------------------------------------
+
+        if path == "/admin/logout":
 
             token = ""
 
-            for x in self.headers.get(
+            cookie = self.headers.get(
                 "Cookie",
                 ""
-            ).split(";"):
+            )
 
-                if x.strip().startswith("cb_admin="):
+            for item in cookie.split(";"):
 
-                    token = x.strip().split(
+                item = item.strip()
+
+                if item.startswith(
+                    "cb_admin="
+                ):
+
+                    token = item.split(
                         "=",
                         1
                     )[1]
 
-            SESSIONS.discard(token)
 
-            return self.html(
+            SESSIONS.discard(
+                token
+            )
+
+
+            return self.send_html(
                 page(
                     "Выход",
-                    "<h1>Вы вышли</h1>"
+                    """
+                    <h1>
+                    Вы вышли из админ-панели
+                    </h1>
+                    """
                 ),
                 headers=[
                     (
                         "Set-Cookie",
-                        "cb_admin=; Max-Age=0; Path=/"
+                        "cb_admin=;"
+                        " Max-Age=0;"
+                        " Path=/"
                     )
                 ]
             )
 
 
+        # ----------------------------------------------------
         # ADMIN
-        if p == "/admin":
+        # ----------------------------------------------------
 
-            if not admin(self):
+        if path == "/admin":
 
-                return self.html(
+            if not is_admin(self):
+
+                return self.send_html(
                     page(
-                        "Админ",
+                        "Вход",
                         """
-                        <h1>Требуется вход</h1>
+                        <h1>
+                        Требуется авторизация
+                        </h1>
 
                         <a class="btn"
                            href="/admin/login">
@@ -599,26 +977,57 @@ class H(BaseHTTPRequestHandler):
                     401
                 )
 
-            return self.render(
-                q.get("q", [""])[0].strip()
+
+            search = query.get(
+                "q",
+                [""]
+            )[0].strip()
+
+
+            return self.render_admin(
+                search
             )
 
 
-        self.send_response(404)
+        # ----------------------------------------------------
+        # 404
+        # ----------------------------------------------------
+
+        self.send_response(
+            404
+        )
+
         self.end_headers()
 
 
-    # ========================================
+    # ========================================================
     # ADMIN PAGE
-    # ========================================
+    # ========================================================
 
-    def render(self, search=""):
+    def render_admin(
+        self,
+        search=""
+    ):
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+
+        # ----------------------------------------------------
+        # USERS
+        # ----------------------------------------------------
 
         with db() as c:
 
             if search:
 
-                like = "%" + search.lower() + "%"
+                like = (
+                    "%"
+                    + search.lower()
+                    + "%"
+                )
+
 
                 users = c.execute(
                     """
@@ -633,11 +1042,19 @@ class H(BaseHTTPRequestHandler):
                         last_seen
                     FROM users
                     WHERE
-                        LOWER(email) LIKE %s
-                        OR LOWER(COALESCE(hwid,'')) LIKE %s
+                        LOWER(email)
+                        LIKE %s
+                        OR
+                        LOWER(
+                            COALESCE(hwid,'')
+                        )
+                        LIKE %s
                     ORDER BY id DESC
                     """,
-                    (like, like)
+                    (
+                        like,
+                        like
+                    )
                 ).fetchall()
 
             else:
@@ -659,7 +1076,23 @@ class H(BaseHTTPRequestHandler):
                 ).fetchall()
 
 
-            keys = c.execute(
+            purchase_codes = c.execute(
+                """
+                SELECT
+                    id,
+                    code,
+                    duration_days,
+                    used,
+                    used_by,
+                    created_at,
+                    used_at
+                FROM purchase_codes
+                ORDER BY id DESC
+                """
+            ).fetchall()
+
+
+            old_keys = c.execute(
                 """
                 SELECT
                     id,
@@ -674,92 +1107,106 @@ class H(BaseHTTPRequestHandler):
             ).fetchall()
 
 
-        now = datetime.now(timezone.utc)
+        # ----------------------------------------------------
+        # USER ROWS
+        # ----------------------------------------------------
 
-        rows = ""
+        user_rows = ""
 
 
-        for r in users:
+        for u in users:
 
             expired = (
-                r[4] is not None
-                and r[4] <= now
+                u[4] is not None
+                and u[4] <= now
             )
 
 
-            if r[3] == "blocked":
+            if u[3] == "blocked":
 
-                badge = (
-                    '<span class="badge blocked">'
-                    'Заблокирован'
-                    '</span>'
+                status = """
+                <span class="badge red">
+                Заблокирован
+                </span>
+                """
+
+                toggle_text = (
+                    "Разблокировать"
                 )
+
+                toggle_class = ""
+
 
             elif expired:
 
-                badge = (
-                    '<span class="badge expired">'
-                    'Истёк'
-                    '</span>'
+                status = """
+                <span class="badge yellow">
+                Истёк
+                </span>
+                """
+
+                toggle_text = (
+                    "Заблокировать"
                 )
+
+                toggle_class = (
+                    "danger"
+                )
+
 
             else:
 
-                badge = (
-                    '<span class="badge">'
-                    'Активен'
-                    '</span>'
+                status = """
+                <span class="badge">
+                Активен
+                </span>
+                """
+
+                toggle_text = (
+                    "Заблокировать"
+                )
+
+                toggle_class = (
+                    "danger"
                 )
 
 
-            toggle_text = (
-                "Разблокировать"
-                if r[3] == "blocked"
-                else "Заблокировать"
-            )
+            user_rows += f"""
 
-            toggle_class = (
-                ""
-                if r[3] == "blocked"
-                else "danger"
-            )
-
-
-            rows += f"""
             <tr>
 
-            <td>{r[0]}</td>
-
             <td>
-                {html.escape(r[1])}
+            {u[0]}
             </td>
 
             <td>
-                <code>
-                {html.escape(r[2] or "не привязан")}
-                </code>
+            {html.escape(u[1])}
             </td>
 
             <td>
-                {badge}
+            <code>
+            {html.escape(
+                u[2] or "не привязан"
+            )}
+            </code>
             </td>
 
             <td>
-                {html.escape(fmt(r[4]))}
+            {status}
             </td>
 
             <td>
-                <code>
-                {html.escape(r[5] or "—")}
-                </code>
+            {html.escape(
+                fmt(u[4])
+            )}
             </td>
 
             <td>
-                {html.escape(fmt(r[6]))}
-            </td>
-
-            <td>
-                {html.escape(fmt(r[7]))}
+            <code>
+            {html.escape(
+                u[5] or "—"
+            )}
+            </code>
             </td>
 
             <td>
@@ -772,10 +1219,13 @@ class H(BaseHTTPRequestHandler):
             <input
                 type="hidden"
                 name="id"
-                value="{r[0]}">
+                value="{u[0]}">
 
-            <button class="{toggle_class}">
+            <button
+                class="{toggle_class}">
+
                 {toggle_text}
+
             </button>
 
             </form>
@@ -787,7 +1237,7 @@ class H(BaseHTTPRequestHandler):
             <input
                 type="hidden"
                 name="id"
-                value="{r[0]}">
+                value="{u[0]}">
 
             <button class="gray">
                 Сбросить HWID
@@ -798,12 +1248,15 @@ class H(BaseHTTPRequestHandler):
 
             <form method="post"
                   action="/admin/delete"
-                  onsubmit="return confirm('Удалить пользователя?')">
+                  onsubmit="
+                  return confirm(
+                  'Удалить пользователя?'
+                  );">
 
             <input
                 type="hidden"
                 name="id"
-                value="{r[0]}">
+                value="{u[0]}">
 
             <button class="danger">
                 Удалить
@@ -816,12 +1269,12 @@ class H(BaseHTTPRequestHandler):
 
             <form method="post"
                   action="/admin/set-expiry"
-                  style="margin-top:7px">
+                  style="margin-top:8px">
 
             <input
                 type="hidden"
                 name="id"
-                value="{r[0]}">
+                value="{u[0]}">
 
             <input
                 name="expires_at"
@@ -836,12 +1289,12 @@ class H(BaseHTTPRequestHandler):
 
             <form method="post"
                   action="/admin/set-hwid"
-                  style="margin-top:7px">
+                  style="margin-top:8px">
 
             <input
                 type="hidden"
                 name="id"
-                value="{r[0]}">
+                value="{u[0]}">
 
             <input
                 name="hwid"
@@ -856,58 +1309,128 @@ class H(BaseHTTPRequestHandler):
             </td>
 
             </tr>
+
             """
 
 
-        if not rows:
+        if not user_rows:
 
-            rows = """
+            user_rows = """
             <tr>
-                <td colspan="9">
-                    Пользователей не найдено.
-                </td>
+            <td colspan="7">
+            Пользователей нет.
+            </td>
             </tr>
             """
 
 
-        key_rows = ""
+        # ----------------------------------------------------
+        # PURCHASE CODE ROWS
+        # ----------------------------------------------------
+
+        purchase_rows = ""
 
 
-        for k in keys:
+        for p in purchase_codes:
 
-            key_rows += f"""
+            duration = p[2]
+
+
+            if duration == 0:
+
+                duration_text = (
+                    "Навсегда"
+                )
+
+            elif duration == 7:
+
+                duration_text = (
+                    "1 неделя"
+                )
+
+            elif duration == 14:
+
+                duration_text = (
+                    "2 недели"
+                )
+
+            elif duration == 30:
+
+                duration_text = (
+                    "1 месяц"
+                )
+
+            else:
+
+                duration_text = (
+                    f"{duration} дней"
+                )
+
+
+            if p[3]:
+
+                status = """
+                <span class="badge red">
+                Использован
+                </span>
+                """
+
+            else:
+
+                status = """
+                <span class="badge">
+                Не использован
+                </span>
+                """
+
+
+            purchase_rows += f"""
+
             <tr>
 
-            <td>{k[0]}</td>
-
             <td>
-                <code>
-                {html.escape(k[1])}
-                </code>
+            {p[0]}
             </td>
 
             <td>
-                {html.escape(fmt(k[2]))}
+            <code>
+            {html.escape(p[1])}
+            </code>
             </td>
 
-            <td>{k[3]}</td>
-
-            <td>{k[4]}</td>
+            <td>
+            {html.escape(duration_text)}
+            </td>
 
             <td>
-                {html.escape(fmt(k[5]))}
+            {status}
+            </td>
+
+            <td>
+            {html.escape(p[4] or "—")}
+            </td>
+
+            <td>
+            {html.escape(fmt(p[5]))}
+            </td>
+
+            <td>
+            {html.escape(fmt(p[6]))}
             </td>
 
             <td>
 
             <form method="post"
-                  action="/admin/delete-key"
-                  onsubmit="return confirm('Удалить ключ?')">
+                  action="/admin/delete-purchase"
+                  onsubmit="
+                  return confirm(
+                  'Удалить код покупки?'
+                  );">
 
             <input
                 type="hidden"
                 name="id"
-                value="{k[0]}">
+                value="{p[0]}">
 
             <button class="danger">
                 Удалить
@@ -918,32 +1441,85 @@ class H(BaseHTTPRequestHandler):
             </td>
 
             </tr>
+
             """
 
 
-        if not key_rows:
+        if not purchase_rows:
 
-            key_rows = """
+            purchase_rows = """
             <tr>
-                <td colspan="7">
-                    Ключей пока нет.
-                </td>
+            <td colspan="8">
+            Кодів покупок пока нет.
+            </td>
             </tr>
             """
 
 
+        # ----------------------------------------------------
+        # OLD ACTIVATION KEYS
+        # ----------------------------------------------------
+
+        key_rows = ""
+
+
+        for k in old_keys:
+
+            key_rows += f"""
+
+            <tr>
+
+            <td>
+            {k[0]}
+            </td>
+
+            <td>
+            <code>
+            {html.escape(k[1])}
+            </code>
+            </td>
+
+            <td>
+            {html.escape(fmt(k[2]))}
+            </td>
+
+            <td>
+            {k[3]}
+            </td>
+
+            <td>
+            {k[4]}
+            </td>
+
+            <td>
+            {html.escape(fmt(k[5]))}
+            </td>
+
+            </tr>
+
+            """
+
+
+        # ----------------------------------------------------
+        # PAGE
+        # ----------------------------------------------------
+
         body = f"""
 
-        <h1>Админ-панель ColorBooster</h1>
+        <h1>
+        ColorBooster — админ-панель
+        </h1>
+
 
         <p>
+
         Пользователей:
         <b>{len(users)}</b>
 
         |
 
-        Ключей:
-        <b>{len(keys)}</b>
+        Кодов покупок:
+        <b>{len(purchase_codes)}</b>
 
         <a class="btn"
            href="/admin">
@@ -954,12 +1530,17 @@ class H(BaseHTTPRequestHandler):
            href="/admin/logout">
            Выйти
         </a>
+
         </p>
 
 
+        <!-- SEARCH -->
+
         <div class="card">
 
-        <h2>Поиск</h2>
+        <h2>
+        Поиск пользователя
+        </h2>
 
         <form method="get"
               action="/admin">
@@ -967,10 +1548,10 @@ class H(BaseHTTPRequestHandler):
         <input
             name="q"
             value="{html.escape(search)}"
-            placeholder="Почта или HWID">
+            placeholder="Email или HWID">
 
         <button>
-            Найти
+        Найти
         </button>
 
         <a class="btn gray"
@@ -983,55 +1564,75 @@ class H(BaseHTTPRequestHandler):
         </div>
 
 
+        <!-- PURCHASE CREATOR -->
+
         <div class="card">
 
-        <h2>Создать дополнительный ключ</h2>
+        <h2>
+        Создать код покупки
+        </h2>
+
+        <p class="muted">
+        Один код покупки можно использовать
+        только один раз.
+        </p>
 
         <form method="post"
-              action="/admin/create-key">
+              action="/admin/create-purchase">
 
-        <input
-            name="expires_at"
-            type="datetime-local">
+        <select
+            name="duration_days"
+            required>
 
-        <input
-            name="max_uses"
-            type="number"
-            min="1"
-            value="1">
+            <option value="7">
+            1 неделя
+            </option>
+
+            <option value="14">
+            2 недели
+            </option>
+
+            <option value="30">
+            1 месяц
+            </option>
+
+            <option value="0">
+            Навсегда
+            </option>
+
+        </select>
 
         <button class="green">
-            Создать ключ
+        Создать код покупки
         </button>
 
         </form>
 
-        <p class="muted">
-        При обычной регистрации ключ создаётся автоматически.
-        </p>
-
         </div>
 
 
-        <h2>Пользователи</h2>
+        <!-- PURCHASE CODES -->
+
+        <h2>
+        Коды покупок
+        </h2>
 
         <table>
 
         <tr>
 
         <th>ID</th>
-        <th>Почта</th>
-        <th>HWID</th>
-        <th>Статус</th>
+        <th>Код</th>
         <th>Срок</th>
-        <th>Ключ</th>
-        <th>Первый</th>
-        <th>Последний</th>
-        <th>Управление</th>
+        <th>Статус</th>
+        <th>Пользователь</th>
+        <th>Создан</th>
+        <th>Использован</th>
+        <th></th>
 
         </tr>
 
-        {rows}
+        {purchase_rows}
 
         </table>
 
@@ -1039,7 +1640,39 @@ class H(BaseHTTPRequestHandler):
         <hr>
 
 
-        <h2>Ключи активации</h2>
+        <!-- USERS -->
+
+        <h2>
+        Пользователи
+        </h2>
+
+        <table>
+
+        <tr>
+
+        <th>ID</th>
+        <th>Email</th>
+        <th>HWID</th>
+        <th>Статус</th>
+        <th>Срок</th>
+        <th>Лицензия</th>
+        <th>Управление</th>
+
+        </tr>
+
+        {user_rows}
+
+        </table>
+
+
+        <hr>
+
+
+        <!-- OLD KEYS -->
+
+        <h2>
+        Старые ключи активации
+        </h2>
 
         <table>
 
@@ -1051,7 +1684,6 @@ class H(BaseHTTPRequestHandler):
         <th>Макс.</th>
         <th>Исп.</th>
         <th>Создан</th>
-        <th>Управление</th>
 
         </tr>
 
@@ -1062,7 +1694,7 @@ class H(BaseHTTPRequestHandler):
         """
 
 
-        return self.html(
+        return self.send_html(
             page(
                 "Админ-панель",
                 body
@@ -1070,30 +1702,35 @@ class H(BaseHTTPRequestHandler):
         )
 
 
-    # ========================================
+    # ========================================================
     # POST
-    # ========================================
+    # ========================================================
 
     def do_POST(self):
 
-        p = urlparse(self.path).path
+        parsed = urlparse(
+            self.path
+        )
+
+        path = parsed.path
 
 
-        # ====================================
-        # APP LOGIN
-        # ====================================
+        # ====================================================
+        # API LOGIN
+        # ====================================================
 
-        if p == "/api/login":
+        if path == "/api/login":
 
             try:
 
                 data = json.loads(
-                    self.body().decode()
+                    self.read_body()
+                    .decode("utf-8")
                 )
 
             except Exception:
 
-                return self.js(
+                return self.send_json(
                     {
                         "error":
                         "Некорректный JSON"
@@ -1103,21 +1740,36 @@ class H(BaseHTTPRequestHandler):
 
 
             email = str(
-                data.get("email", "")
+                data.get(
+                    "email",
+                    ""
+                )
             ).strip().lower()
 
+
             password = str(
-                data.get("password", "")
+                data.get(
+                    "password",
+                    ""
+                )
             )
 
+
             hwid = str(
-                data.get("hwid", "")
+                data.get(
+                    "hwid",
+                    ""
+                )
             ).strip()
 
 
-            if not email or not password or not hwid:
+            if (
+                not email
+                or not password
+                or not hwid
+            ):
 
-                return self.js(
+                return self.send_json(
                     {
                         "error":
                         "Не хватает данных"
@@ -1143,15 +1795,23 @@ class H(BaseHTTPRequestHandler):
                 ).fetchone()
 
 
-                if (
-                    not user
-                    or not secrets.compare_digest(
-                        user[1],
-                        ph(password)
+                if not user:
+
+                    return self.send_json(
+                        {
+                            "error":
+                            "Неверная почта или пароль"
+                        },
+                        401
                     )
+
+
+                if not secrets.compare_digest(
+                    user[1],
+                    ph(password)
                 ):
 
-                    return self.js(
+                    return self.send_json(
                         {
                             "error":
                             "Неверная почта или пароль"
@@ -1162,10 +1822,10 @@ class H(BaseHTTPRequestHandler):
 
                 if user[3] == "blocked":
 
-                    return self.js(
+                    return self.send_json(
                         {
                             "error":
-                            "Аккаунт заблокирован администратором"
+                            "Аккаунт заблокирован"
                         },
                         403
                     )
@@ -1173,13 +1833,16 @@ class H(BaseHTTPRequestHandler):
 
                 if (
                     user[4] is not None
-                    and user[4] <= datetime.now(timezone.utc)
+                    and user[4]
+                    <= datetime.now(
+                        timezone.utc
+                    )
                 ):
 
-                    return self.js(
+                    return self.send_json(
                         {
                             "error":
-                            "Срок действия лицензии истёк"
+                            "Срок лицензии истёк"
                         },
                         403
                     )
@@ -1193,10 +1856,10 @@ class H(BaseHTTPRequestHandler):
                     )
                 ):
 
-                    return self.js(
+                    return self.send_json(
                         {
                             "error":
-                            "HWID этого аккаунта привязан к другому компьютеру"
+                            "HWID привязан к другому компьютеру"
                         },
                         403
                     )
@@ -1217,29 +1880,49 @@ class H(BaseHTTPRequestHandler):
                 )
 
 
-            return self.js(
+            return self.send_json(
                 {
-                    "ok": True,
-                    "hwid": hwid
+                    "ok": True
                 }
             )
 
 
-        # ====================================
-        # REGISTRATION
-        # ====================================
+        # ====================================================
+        # FORM DATA
+        # ====================================================
 
-        q = parse_qs(
-            self.body().decode()
-        )
+        try:
+
+            body = self.read_body().decode(
+                "utf-8"
+            )
+
+            q = parse_qs(
+                body
+            )
+
+        except Exception:
+
+            return self.send_html(
+                page(
+                    "Ошибка",
+                    "<h1>Ошибка данных</h1>"
+                ),
+                400
+            )
 
 
-        if p == "/register":
+        # ====================================================
+        # REGISTER
+        # ====================================================
+
+        if path == "/register":
 
             email = q.get(
                 "email",
                 [""]
             )[0].strip().lower()
+
 
             password = q.get(
                 "password",
@@ -1247,12 +1930,31 @@ class H(BaseHTTPRequestHandler):
             )[0]
 
 
-            if not email or "@" not in email:
+            purchase_code = q.get(
+                "purchase_code",
+                [""]
+            )[0].strip().upper()
 
-                return self.html(
+
+            if (
+                not email
+                or "@"
+                not in email
+            ):
+
+                return self.send_html(
                     page(
                         "Ошибка",
-                        "<h1>Некорректная почта</h1>"
+                        """
+                        <h1>
+                        Некорректный email
+                        </h1>
+
+                        <a class="btn"
+                           href="/register">
+                           Назад
+                        </a>
+                        """
                     ),
                     400
                 )
@@ -1260,113 +1962,276 @@ class H(BaseHTTPRequestHandler):
 
             if len(password) < 6:
 
-                return self.html(
+                return self.send_html(
                     page(
                         "Ошибка",
-                        "<h1>Пароль должен быть не короче 6 символов</h1>"
+                        """
+                        <h1>
+                        Пароль должен содержать
+                        минимум 6 символов
+                        </h1>
+
+                        <a class="btn"
+                           href="/register">
+                           Назад
+                        </a>
+                        """
                     ),
                     400
                 )
 
 
-            # --------------------------------
-            # СОЗДАЁМ КЛЮЧ АВТОМАТИЧЕСКИ
-            # --------------------------------
+            if not purchase_code:
 
-            license_key = make_license(
-                LICENSE_DAYS
-            )
-
-            expires_at = (
-                datetime.now(timezone.utc)
-                + timedelta(days=LICENSE_DAYS)
-            )
-
-
-            try:
-
-                with db() as c:
-
-                    # Проверяем почту
-                    existing = c.execute(
-                        """
-                        SELECT id
-                        FROM users
-                        WHERE email=%s
-                        """,
-                        (email,)
-                    ).fetchone()
-
-
-                    if existing:
-
-                        return self.html(
-                            page(
-                                "Ошибка",
-                                """
-                                <h1>
-                                Эта почта уже зарегистрирована
-                                </h1>
-
-                                <a class="btn"
-                                   href="/register">
-                                   Назад
-                                </a>
-                                """
-                            ),
-                            409
-                        )
-
-
-                    # Создаём пользователя
-                    c.execute(
-                        """
-                        INSERT INTO users(
-                            email,
-                            password_hash,
-                            activation_key,
-                            expires_at
-                        )
-                        VALUES(%s,%s,%s,%s)
-                        """,
-                        (
-                            email,
-                            ph(password),
-                            license_key,
-                            expires_at
-                        )
-                    )
-
-
-            except Exception as e:
-
-                print(
-                    "Registration error:",
-                    repr(e)
-                )
-
-                return self.html(
+                return self.send_html(
                     page(
                         "Ошибка",
                         """
                         <h1>
-                        Не удалось завершить регистрацию
+                        Введите код покупки
                         </h1>
 
-                        <p>
-                        Попробуйте ещё раз.
-                        </p>
+                        <a class="btn"
+                           href="/register">
+                           Назад
+                        </a>
                         """
                     ),
-                    500
+                    400
                 )
 
 
-            # --------------------------------
-            # ПОКАЗЫВАЕМ КЛЮЧ
-            # --------------------------------
+            with db() as c:
 
-            return self.html(
+                # --------------------------------------------
+                # CHECK EMAIL
+                # --------------------------------------------
+
+                existing = c.execute(
+                    """
+                    SELECT id
+                    FROM users
+                    WHERE email=%s
+                    """,
+                    (email,)
+                ).fetchone()
+
+
+                if existing:
+
+                    return self.send_html(
+                        page(
+                            "Ошибка",
+                            """
+                            <h1>
+                            Этот email уже зарегистрирован
+                            </h1>
+
+                            <a class="btn"
+                               href="/register">
+                               Назад
+                            </a>
+                            """
+                        ),
+                        409
+                    )
+
+
+                # --------------------------------------------
+                # CHECK PURCHASE CODE
+                # --------------------------------------------
+
+                purchase = c.execute(
+                    """
+                    SELECT
+                        id,
+                        duration_days,
+                        used
+                    FROM purchase_codes
+                    WHERE code=%s
+                    FOR UPDATE
+                    """,
+                    (
+                        purchase_code,
+                    )
+                ).fetchone()
+
+
+                if not purchase:
+
+                    return self.send_html(
+                        page(
+                            "Ошибка",
+                            """
+                            <h1>
+                            Неверный код покупки
+                            </h1>
+
+                            <p>
+                            Проверьте код и попробуйте
+                            ещё раз.
+                            </p>
+
+                            <a class="btn"
+                               href="/register">
+                               Назад
+                            </a>
+                            """
+                        ),
+                        400
+                    )
+
+
+                if purchase[2]:
+
+                    return self.send_html(
+                        page(
+                            "Ошибка",
+                            """
+                            <h1>
+                            Этот код покупки уже использован
+                            </h1>
+
+                            <p>
+                            Один код покупки можно
+                            использовать только один раз.
+                            </p>
+
+                            <a class="btn"
+                               href="/register">
+                               Назад
+                            </a>
+                            """
+                        ),
+                        400
+                    )
+
+
+                # --------------------------------------------
+                # LICENSE DURATION
+                # --------------------------------------------
+
+                duration_days = purchase[1]
+
+
+                if duration_days == 0:
+
+                    # 0 = forever
+                    expires_at = (
+                        datetime(
+                            9999,
+                            12,
+                            31,
+                            tzinfo=timezone.utc
+                        )
+                    )
+
+                else:
+
+                    expires_at = (
+                        datetime.now(
+                            timezone.utc
+                        )
+                        +
+                        timedelta(
+                            days=duration_days
+                        )
+                    )
+
+
+                # --------------------------------------------
+                # GENERATE LICENSE
+                # --------------------------------------------
+
+                license_key = make_license(
+                    duration_days
+                )
+
+
+                # --------------------------------------------
+                # CREATE USER
+                # --------------------------------------------
+
+                c.execute(
+                    """
+                    INSERT INTO users(
+                        email,
+                        password_hash,
+                        activation_key,
+                        expires_at
+                    )
+                    VALUES(
+                        %s,
+                        %s,
+                        %s,
+                        %s
+                    )
+                    """,
+                    (
+                        email,
+                        ph(password),
+                        license_key,
+                        expires_at
+                    )
+                )
+
+
+                # --------------------------------------------
+                # MARK PURCHASE CODE USED
+                # --------------------------------------------
+
+                c.execute(
+                    """
+                    UPDATE purchase_codes
+                    SET
+                        used=TRUE,
+                        used_by=%s,
+                        used_at=CURRENT_TIMESTAMP
+                    WHERE id=%s
+                    """,
+                    (
+                        email,
+                        purchase[0]
+                    )
+                )
+
+
+            # --------------------------------------------
+            # SUCCESS PAGE
+            # --------------------------------------------
+
+            if duration_days == 0:
+
+                duration_text = (
+                    "Навсегда"
+                )
+
+            elif duration_days == 7:
+
+                duration_text = (
+                    "1 неделя"
+                )
+
+            elif duration_days == 14:
+
+                duration_text = (
+                    "2 недели"
+                )
+
+            elif duration_days == 30:
+
+                duration_text = (
+                    "1 месяц"
+                )
+
+            else:
+
+                duration_text = (
+                    f"{duration_days} дней"
+                )
+
+
+            return self.send_html(
                 page(
                     "Регистрация завершена",
                     f"""
@@ -1381,21 +2246,27 @@ class H(BaseHTTPRequestHandler):
                     </p>
 
                     <p>
-                    Твой лицензионный ключ:
+                    Ваша лицензия:
                     </p>
 
                     <div class="license">
-                    {html.escape(license_key)}
+                    {html.escape(
+                        license_key
+                    )}
                     </div>
 
-                    <p class="muted">
-                    Срок действия:
-                    {html.escape(fmt(expires_at))}
+                    <p>
+                    Срок:
+                    <b>
+                    {html.escape(
+                        duration_text
+                    )}
+                    </b>
                     </p>
 
-                    <p>
-                    Скопируй этот ключ и введи его
-                    в ColorBooster.
+                    <p class="muted">
+                    Скопируйте этот ключ
+                    и вставьте его в ColorBooster.
                     </p>
 
                     </div>
@@ -1409,21 +2280,22 @@ class H(BaseHTTPRequestHandler):
             )
 
 
-        # ====================================
+        # ====================================================
         # ADMIN LOGIN
-        # ====================================
+        # ====================================================
 
-        if p == "/admin/login":
+        if path == "/admin/login":
 
             user = q.get(
                 "user",
                 [""]
             )[0].strip()
 
+
             password = q.get(
                 "password",
                 [""]
-            )[0].strip()
+            )[0]
 
 
             if (
@@ -1438,20 +2310,31 @@ class H(BaseHTTPRequestHandler):
                 )
             ):
 
-                return self.html(
+                return self.send_html(
                     page(
                         "Ошибка",
-                        "<h1>Неверный логин или пароль</h1>"
+                        """
+                        <h1>
+                        Неверный логин или пароль
+                        </h1>
+                        """
                     ),
                     401
                 )
 
 
-            token = secrets.token_urlsafe(32)
+            token = secrets.token_urlsafe(
+                32
+            )
 
-            SESSIONS.add(token)
+            SESSIONS.add(
+                token
+            )
 
-            self.send_response(303)
+
+            self.send_response(
+                303
+            )
 
             self.send_header(
                 "Location",
@@ -1471,20 +2354,231 @@ class H(BaseHTTPRequestHandler):
             return
 
 
-        # ====================================
-        # ADMIN ACTIONS
-        # ====================================
+        # ====================================================
+        # EVERYTHING BELOW REQUIRES ADMIN
+        # ====================================================
 
-        if p.startswith("/admin/") and not admin(self):
+        if path.startswith(
+            "/admin/"
+        ) and not is_admin(self):
 
-            return self.html(
+            return self.send_html(
                 page(
                     "Ошибка",
-                    "<h1>Сначала войдите</h1>"
+                    """
+                    <h1>
+                    Требуется вход в админку
+                    </h1>
+                    """
                 ),
                 401
             )
 
+
+        # ====================================================
+        # CREATE PURCHASE CODE
+        # ====================================================
+
+        if path == "/admin/create-purchase":
+
+            duration_text = q.get(
+                "duration_days",
+                ["30"]
+            )[0]
+
+
+            try:
+
+                duration_days = int(
+                    duration_text
+                )
+
+            except ValueError:
+
+                return self.send_html(
+                    page(
+                        "Ошибка",
+                        """
+                        <h1>
+                        Некорректный срок
+                        </h1>
+                        """
+                    ),
+                    400
+                )
+
+
+            if duration_days not in (
+                7,
+                14,
+                30,
+                0
+            ):
+
+                return self.send_html(
+                    page(
+                        "Ошибка",
+                        """
+                        <h1>
+                        Некорректный срок
+                        </h1>
+                        """
+                    ),
+                    400
+                )
+
+
+            # Generate unique code
+            for _ in range(10):
+
+                code = (
+                    make_purchase_code()
+                )
+
+                try:
+
+                    with db() as c:
+
+                        c.execute(
+                            """
+                            INSERT INTO
+                            purchase_codes(
+                                code,
+                                duration_days
+                            )
+                            VALUES(%s,%s)
+                            """,
+                            (
+                                code,
+                                duration_days
+                            )
+                        )
+
+                    break
+
+                except psycopg.errors.UniqueViolation:
+
+                    continue
+
+            else:
+
+                return self.send_html(
+                    page(
+                        "Ошибка",
+                        """
+                        <h1>
+                        Не удалось создать код
+                        </h1>
+                        """
+                    ),
+                    500
+                )
+
+
+            if duration_days == 0:
+
+                duration_name = (
+                    "Навсегда"
+                )
+
+            elif duration_days == 7:
+
+                duration_name = (
+                    "1 неделя"
+                )
+
+            elif duration_days == 14:
+
+                duration_name = (
+                    "2 недели"
+                )
+
+            else:
+
+                duration_name = (
+                    "1 месяц"
+                )
+
+
+            return self.send_html(
+                page(
+                    "Код покупки",
+                    f"""
+                    <h1>
+                    Код покупки создан
+                    </h1>
+
+                    <div class="card">
+
+                    <p>
+                    Срок лицензии:
+                    <b>
+                    {duration_name}
+                    </b>
+                    </p>
+
+                    <div class="purchase">
+                    {html.escape(code)}
+                    </div>
+
+                    <p class="muted">
+                    Отправь этот код покупателю.
+                    Повторно использовать его
+                    будет нельзя.
+                    </p>
+
+                    </div>
+
+                    <a class="btn"
+                       href="/admin">
+                       Вернуться в админку
+                    </a>
+                    """
+                )
+            )
+
+
+        # ====================================================
+        # DELETE PURCHASE CODE
+        # ====================================================
+
+        if path == "/admin/delete-purchase":
+
+            try:
+
+                purchase_id = int(
+                    q.get(
+                        "id",
+                        ["0"]
+                    )[0]
+                )
+
+            except ValueError:
+
+                purchase_id = 0
+
+
+            with db() as c:
+
+                c.execute(
+                    """
+                    DELETE FROM purchase_codes
+                    WHERE id=%s
+                    """,
+                    (
+                        purchase_id,
+                    )
+                )
+
+
+            return self.redirect(
+                "/admin"
+            )
+
+
+        # ====================================================
+        # USER ID
+        # ====================================================
 
         try:
 
@@ -1495,31 +2589,48 @@ class H(BaseHTTPRequestHandler):
                 )[0]
             )
 
-        except Exception:
+        except ValueError:
 
             user_id = 0
 
 
-        with db() as c:
+        # ====================================================
+        # TOGGLE USER
+        # ====================================================
 
-            if p == "/admin/toggle":
+        if path == "/admin/toggle":
+
+            with db() as c:
 
                 c.execute(
                     """
                     UPDATE users
                     SET status =
                         CASE
-                        WHEN status='blocked'
-                        THEN 'active'
-                        ELSE 'blocked'
+                            WHEN status='blocked'
+                            THEN 'active'
+                            ELSE 'blocked'
                         END
                     WHERE id=%s
                     """,
-                    (user_id,)
+                    (
+                        user_id,
+                    )
                 )
 
 
-            elif p == "/admin/reset-hwid":
+            return self.redirect(
+                "/admin"
+            )
+
+
+        # ====================================================
+        # RESET HWID
+        # ====================================================
+
+        if path == "/admin/reset-hwid":
+
+            with db() as c:
 
                 c.execute(
                     """
@@ -1527,28 +2638,30 @@ class H(BaseHTTPRequestHandler):
                     SET hwid=NULL
                     WHERE id=%s
                     """,
-                    (user_id,)
+                    (
+                        user_id,
+                    )
                 )
 
 
-            elif p == "/admin/set-hwid":
-
-                hwid = q.get(
-                    "hwid",
-                    [""]
-                )[0].strip()
+            return self.redirect(
+                "/admin"
+            )
 
 
-                if not hwid:
+        # ====================================================
+        # SET HWID
+        # ====================================================
 
-                    return self.html(
-                        page(
-                            "Ошибка",
-                            "<h1>HWID не введён</h1>"
-                        ),
-                        400
-                    )
+        if path == "/admin/set-hwid":
 
+            hwid = q.get(
+                "hwid",
+                [""]
+            )[0].strip()
+
+
+            with db() as c:
 
                 c.execute(
                     """
@@ -1563,7 +2676,26 @@ class H(BaseHTTPRequestHandler):
                 )
 
 
-            elif p == "/admin/set-expiry":
+            return self.redirect(
+                "/admin"
+            )
+
+
+        # ====================================================
+        # SET EXPIRY
+        # ====================================================
+
+        if path == "/admin/set-expiry":
+
+            expires = parse_datetime(
+                q.get(
+                    "expires_at",
+                    [""]
+                )[0]
+            )
+
+
+            with db() as c:
 
                 c.execute(
                     """
@@ -1572,112 +2704,71 @@ class H(BaseHTTPRequestHandler):
                     WHERE id=%s
                     """,
                     (
-                        dt(
-                            q.get(
-                                "expires_at",
-                                [""]
-                            )[0]
-                        ),
+                        expires,
                         user_id
                     )
                 )
 
 
-            elif p == "/admin/delete":
+            return self.redirect(
+                "/admin"
+            )
+
+
+        # ====================================================
+        # DELETE USER
+        # ====================================================
+
+        if path == "/admin/delete":
+
+            with db() as c:
 
                 c.execute(
                     """
                     DELETE FROM users
                     WHERE id=%s
                     """,
-                    (user_id,)
-                )
-
-
-            elif p == "/admin/create-key":
-
-                try:
-
-                    uses = max(
-                        1,
-                        min(
-                            int(
-                                q.get(
-                                    "max_uses",
-                                    ["1"]
-                                )[0]
-                            ),
-                            100000
-                        )
-                    )
-
-                except Exception:
-
-                    uses = 1
-
-
-                # Дополнительный ключ
-                new_key = make_license(
-                    LICENSE_DAYS
-                )
-
-
-                c.execute(
-                    """
-                    INSERT INTO activation_keys(
-                        key,
-                        expires_at,
-                        max_uses
-                    )
-                    VALUES(%s,%s,%s)
-                    """,
                     (
-                        new_key,
-                        dt(
-                            q.get(
-                                "expires_at",
-                                [""]
-                            )[0]
-                        ),
-                        uses
+                        user_id,
                     )
                 )
 
 
-            elif p == "/admin/delete-key":
-
-                c.execute(
-                    """
-                    DELETE FROM activation_keys
-                    WHERE id=%s
-                    """,
-                    (user_id,)
-                )
+            return self.redirect(
+                "/admin"
+            )
 
 
-            else:
+        # ====================================================
+        # UNKNOWN ADMIN ACTION
+        # ====================================================
 
-                self.send_response(404)
-                self.end_headers()
-                return
+        self.send_response(
+            404
+        )
+
+        self.end_headers()
 
 
-        redirect_admin(self)
-
-
-# ============================================
-# START
-# ============================================
+# ============================================================
+# START SERVER
+# ============================================================
 
 if __name__ == "__main__":
 
     init_db()
 
     print(
-        f"Listening on {HOST}:{PORT}"
+        f"ColorBooster server listening "
+        f"on {HOST}:{PORT}"
     )
 
-    ThreadingHTTPServer(
-        (HOST, PORT),
-        H
-    ).serve_forever()
+    server = ThreadingHTTPServer(
+        (
+            HOST,
+            PORT
+        ),
+        Handler
+    )
+
+    server.serve_forever()
