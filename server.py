@@ -91,6 +91,6 @@ def init_db():
         """)
 
 def page(title, body):
-    return """<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{}</title><style>
+    # Build the HTML without multiline string delimiters so copy/paste
+    # through GitHub's editor cannot break Python's triple-quoted strings.
+    template = (
