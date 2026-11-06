@@ -1,108 +1,96 @@
+import os
+import json
+import html
+import hmac
+import hashlib
+import secrets
+from datetime import datetime, timezone, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+from http.cookies import SimpleCookie
 
-        # Every admin action below requires a valid session.
-        if path.startswith("/admin/") and not is_admin(self):
-            return self.send_html(page("Ошибка", '<section class="panel"><h1>Требуется вход</h1><a href="/admin/login">Войти</a></section>'), 401)
+import psycopg
 
-        def form_int(name):
-            try:
-                return int(q.get(name, ["0"])[0])
-            except (ValueError, TypeError):
-                return 0
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", "8765"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+LICENSE_SECRET = os.environ.get("LICENSE_SECRET", "")
+PURCHASE_PREFIX = "CB-PURCHASE"
+SESSIONS = set()
 
-        if path == "/admin/create-purchase":
-            duration = form_int("duration_days")
-            if duration not in (0, 7, 14, 30):
-                return self.send_html(page("Ошибка", "<h1>Неверный срок</h1>"), 400)
+def now():
+    return datetime.now(timezone.utc)
 
-            for _ in range(10):
-                code = make_purchase_code()
-                try:
-                    with db() as c:
-                        c.execute("""
-                            INSERT INTO purchase_codes(code,duration_days)
-                            VALUES(%s,%s)
-                        """, (code, duration))
-                    break
-                except psycopg.errors.UniqueViolation:
-                    continue
-            else:
-                return self.send_html(page("Ошибка", "<h1>Не удалось создать код</h1>"), 500)
+def db():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured in Render Environment")
+    return psycopg.connect(DATABASE_URL)
 
-            return self.send_html(page(
-                "Код покупки",
-                f'<section class="panel"><h1>Код создан</h1><div class="purchase">{html.escape(code)}</div><p>Срок: {"Навсегда" if duration == 0 else str(duration) + " дней"}</p><a class="btn" href="/admin">Назад в админку</a></section>'
-            ))
+def password_hash(password):
+    # Compatible with the earlier ColorBooster backend.
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), b"ColorBooster-2026", 120000
+    ).hex()
 
-        if path == "/admin/delete-purchase":
-            with db() as c:
-                c.execute("DELETE FROM purchase_codes WHERE id=%s", (form_int("id"),))
-            return self.redirect("/admin")
+def hwid_digest(hwid):
+    return hashlib.sha256(hwid.strip().encode("utf-8")).hexdigest()
 
-        if path == "/admin/ban-hwid":
-            user_id = form_int("id")
-            reason = q.get("reason", ["Заблокировано администратором"])[0].strip()[:300]
-            with db() as c:
-                user = c.execute("SELECT email,hwid FROM users WHERE id=%s", (user_id,)).fetchone()
-                if user and user[1]:
-                    hwid = user[1].strip()
-                    c.execute("""
-                        INSERT INTO banned_devices(hwid,hwid_hash,user_email,reason)
-                        VALUES(%s,%s,%s,%s)
-                        ON CONFLICT(hwid_hash) DO UPDATE SET
-                            user_email=EXCLUDED.user_email,
-                            reason=EXCLUDED.reason
-                    """, (hwid, hwid_digest(hwid), user[0], reason or "Заблокировано администратором"))
-            return self.redirect("/admin")
+def make_purchase_code():
+    return PURCHASE_PREFIX + "-" + secrets.token_hex(4).upper()
 
-        if path == "/admin/unban-hwid":
-            with db() as c:
-                c.execute("DELETE FROM banned_devices WHERE id=%s", (form_int("id"),))
-            return self.redirect("/admin")
+def make_license(email, expires_at):
+    if not LICENSE_SECRET:
+        raise RuntimeError("Set LICENSE_SECRET in Render Environment")
+    if expires_at is None:
+        expiry = 0xFFFFFFFF
+    else:
+        expiry = int(expires_at.timestamp())
+    payload = f"{email.lower()}|{expiry}"
+    signature = hmac.new(
+        LICENSE_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:16].upper()
+    return f"CB-{expiry:08X}-{signature}"
 
-        user_id = form_int("id")
+def init_db():
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id BIGSERIAL PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                hwid TEXT,
+                status TEXT NOT NULL DEFAULT 'active',
+                expires_at TIMESTAMPTZ,
+                activation_key TEXT,
+                first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen TIMESTAMPTZ
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS purchase_codes (
+                id BIGSERIAL PRIMARY KEY,
+                code TEXT UNIQUE NOT NULL,
+                duration_days INTEGER NOT NULL DEFAULT 30,
+                used BOOLEAN NOT NULL DEFAULT FALSE,
+                used_by TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                used_at TIMESTAMPTZ
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS banned_devices (
+                id BIGSERIAL PRIMARY KEY,
+                hwid TEXT NOT NULL,
+                hwid_hash TEXT UNIQUE NOT NULL,
+                user_email TEXT,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
 
-        if path == "/admin/toggle":
-            with db() as c:
-                c.execute("""
-                    UPDATE users SET status=CASE
-                        WHEN status='blocked' THEN 'active' ELSE 'blocked'
-                    END WHERE id=%s
-                """, (user_id,))
-            return self.redirect("/admin")
-
-        if path == "/admin/reset-hwid":
-            with db() as c:
-                c.execute("UPDATE users SET hwid=NULL WHERE id=%s", (user_id,))
-            return self.redirect("/admin")
-
-        if path == "/admin/set-hwid":
-            hwid = q.get("hwid", [""])[0].strip()[:512]
-            with db() as c:
-                c.execute("UPDATE users SET hwid=%s WHERE id=%s", (hwid or None, user_id))
-            return self.redirect("/admin")
-
-        if path == "/admin/set-expiry":
-            expires = parse_datetime(q.get("expires_at", [""])[0])
-            with db() as c:
-                c.execute("UPDATE users SET expires_at=%s WHERE id=%s", (expires, user_id))
-            return self.redirect("/admin")
-
-        if path == "/admin/delete":
-            with db() as c:
-                c.execute("DELETE FROM users WHERE id=%s", (user_id,))
-            return self.redirect("/admin")
-
-        return self.send_html(page("404", "<section class='panel'><h1>Неизвестное действие</h1></section>"), 404)
-
-
-# ============================================================
-# START
-# ============================================================
-
-if __name__ == "__main__":
-    if not ADMIN_PASSWORD:
-        raise RuntimeError("Set ADMIN_PASSWORD in Render Environment")
-    init_db()
-    print(f"ColorBooster server listening on {HOST}:{PORT}")
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    server.serve_forever()
+def page(title, body):
+    return """<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{}</title><style>
